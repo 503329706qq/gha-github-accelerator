@@ -129,6 +129,12 @@ func New(o Options) *Server {
 					o.OnUpstreamIPOK(ip)
 				}
 			},
+			onDegraded: func(host string, failures int) {
+				if o.Logger != nil {
+					o.Logger.Error("upstream 链路级故障 host=%s：短时间内 %d 次尝试都拿不到响应，%s 内改为单次尝试快速失败",
+						host, failures, degradedWindow)
+				}
+			},
 		},
 		FlushInterval: 100 * time.Millisecond,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
