@@ -1,0 +1,19 @@
+# 构建产物
+dist/
+*.exe
+
+# 本地自测/验收产物（hosts 快照、运行日志、临时数据目录）
+.superpowers/
+.gha-test/
+accept-*.log
+accept-run.out
+accept-run.err
+accept-snap/
+install-out.txt
+smoke-data/
+smoke.log
+smoke-run.log
+gha-run.out
+gha-run.err
+gha-task-*.out
+*.log

@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          $out = gofmt -l internal main.go
+          if ($out) { Write-Host "以下文件未格式化：`n$out"; exit 1 }
+      - name: build
+        run: go build ./...
+      - name: test
+        run: go test ./... -count=1
