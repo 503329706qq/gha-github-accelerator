@@ -6,6 +6,7 @@
 package dialer
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -402,6 +405,11 @@ type result struct {
 // （2026-11-03 的 20.205.243.166 / 140.82.112.4 就是这样），这种地址会让一次
 // 请求白等到超时才 502。TLS 能握手，才说明这条路上真的有流量。
 func (d *Dialer) ProbeTLS(ctx context.Context, host string, ip netip.Addr, timeout time.Duration) error {
+	return d.probeTLSPort(ctx, host, ip, 443, timeout)
+}
+
+// probeTLSPort 是 ProbeTLS 的实现，端口可注入以便测试用高位端口起假上游。
+func (d *Dialer) probeTLSPort(ctx context.Context, host string, ip netip.Addr, port int, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
@@ -410,33 +418,72 @@ func (d *Dialer) ProbeTLS(ctx context.Context, host string, ip netip.Addr, timeo
 		base = &net.Dialer{Timeout: timeout}
 	}
 	start := time.Now()
-	conn, err := base.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), "443"))
+	conn, err := base.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
 	if err != nil {
 		d.recordProbe(ip, 0, false)
 		return err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	tc := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	// 用与真实拨号一致的 TLS 配置（同一套根证书、同样只谈 h1），
+	// 否则会出现"探测能过、真拨号因为证书链不同而失败"的错配。
+	tc := tls.Client(conn, d.tlsConfig(host))
 	if err := tc.HandshakeContext(ctx); err != nil {
 		d.recordProbe(ip, 0, false)
 		return err
 	}
 	// 握手成功还不够：本机实测存在"TLS 握手完成、之后一个字节都不回"的地址
 	// （2026-11-03 的 20.205.243.166 就是这样），只测握手会把它们标成好地址。
-	// 所以再发一个最小的 HTTP 请求，读到响应首字节才算真的通。
+	// 所以再发一个最小的 HTTP 请求，读到状态行、且不是风控拦截页，才算真的通。
 	if _, err := io.WriteString(tc, "HEAD / HTTP/1.1\r\nHost: "+host+"\r\nUser-Agent: gha-probe\r\nConnection: close\r\n\r\n"); err != nil {
 		d.recordProbe(ip, 0, false)
 		return err
 	}
 	_ = tc.SetReadDeadline(time.Now().Add(timeout))
-	var b [1]byte
-	if _, err := io.ReadFull(tc, b[:]); err != nil {
+	// 只读一个字节是不够的：GitHub 的风控拦截页也是正常回字节的
+	// （400 "Whoa there!"、403 "Access to this site has been restricted"），
+	// 读一个字节就把它们当成可用地址，结果是评分表里一片假的好地址，而且
+	// gha 会继续往这排地址上打探测流量，反过来延长封禁。
+	// 所以要读出状态行，把明确的拦截码判成失败。
+	br := bufio.NewReader(io.LimitReader(tc, 512))
+	line, err := br.ReadString('\n')
+	if err != nil {
 		d.recordProbe(ip, 0, false)
 		return fmt.Errorf("probe %s: 握手成功但读不到响应: %w", ip, err)
 	}
+	if err := checkStatusLine(line); err != nil {
+		d.recordProbe(ip, 0, false)
+		return fmt.Errorf("probe %s: %w", ip, err)
+	}
 	d.recordProbe(ip, time.Since(start), true)
 	return nil
+}
+
+// checkStatusLine 判断上游回的状态行能不能说明"这条路上真能拿到内容"。
+//
+// 400/403/429 是 GitHub 边缘层对"这个客户端/IP 不顺眼"的拒绝页
+// （400 = "Whoa there! You have sent an invalid request"，
+// 403 = "Access to this site has been restricted"）。它们同样会正常回字节，
+// 所以判活不能只看"有没有读到东西"。解析不出状态码时按"不影响判断"处理。
+func checkStatusLine(line string) error {
+	switch code := statusCode(line); code {
+	case 400, 403, 429:
+		return fmt.Errorf("上游返回 %d（疑似风控拦截页），不算可用地址", code)
+	}
+	return nil
+}
+
+// statusCode 从 "HTTP/1.1 200 OK" 这样的状态行里取出状态码；取不到返回 0。
+func statusCode(line string) int {
+	f := strings.Fields(line)
+	if len(f) < 2 {
+		return 0
+	}
+	code, err := strconv.Atoi(f[1])
+	if err != nil {
+		return 0
+	}
+	return code
 }
 
 // DialContext 是纯 TCP 竞速，给"不终结 TLS 的原样透传"用。

@@ -255,16 +255,21 @@ func cmdRun(a Args) int {
 	// 一次请求白等到超时才 502；而当时能用的 140.82.112.3 排在候选后面。
 	// 只测 TCP 分辨不出这种地址，所以这里直接做 TLS 握手——通了才算数。
 	go func() {
-		warmUpUpstreams(dl, res, logger)
-		// 每 5 分钟重探一轮：GitHub 的可用地址段是整段整段漂移的，一次探测
-		// 只能管一阵子。探测本身很轻（每个候选一次 TLS 握手），失败也会被
-		// 记成负分，不会因为"上一轮可用"就一直把流量往死地址上送。
-		t := time.NewTicker(5 * time.Minute)
+		warmUpUpstreams(dl, res, logger, warmupFullProbe)
+		// 周期探测只做小范围确认，见 warmupQuickProbe/warmupInterval 的注释。
+		var quietUntil time.Time
+		t := time.NewTicker(warmupInterval)
 		defer t.Stop()
 		for {
 			select {
 			case <-t.C:
-				warmUpUpstreams(dl, res, logger)
+				if time.Now().Before(quietUntil) {
+					continue
+				}
+				if warmUpUpstreams(dl, res, logger, warmupQuickProbe) == 0 {
+					quietUntil = time.Now().Add(warmupQuiet)
+					logger.Info("上游探测整轮无可用地址，%s 内暂停周期探测（避免继续给上游添噪音）", warmupQuiet)
+				}
 			case <-quit:
 				return
 			}
@@ -395,27 +400,44 @@ func (p *probeDebouncer) Fire(host string, fn func()) {
 	go fn()
 }
 
+const (
+	// warmupFullProbe 是启动时每域名探多少个候选。种子表把常年黑洞的
+	// Fastly 段（140.82.x）排在最前，能用的 Azure 段（20.x）在第 11 位之后，
+	// 只探前几个会永远探不到好地址，所以启动时按种子规模探一遍。
+	warmupFullProbe = 24
+	// warmupQuickProbe 是周期探测的规模：好地址一旦被实测确认就会排到评分
+	// 前面，之后只需要确认头部这几个还有效。
+	warmupQuickProbe = 6
+	// warmupInterval 是周期探测间隔。原先是 5 分钟 × 每域名 24 个候选 ×
+	// 6 个热门域名 ≈ 1700 请求/小时，常年不停、与有没有故障无关，对上游
+	// 就是扫描器特征；放宽到 15 分钟、每域名 6 个之后约 144 请求/小时。
+	warmupInterval = 15 * time.Minute
+	// warmupQuiet：一整轮探测一个可用地址都没有，说明要么链路整段断了、
+	// 要么上游正在拦我们。这时候继续按轮打请求只会让情况更糟（2026-11-04
+	// 17:00 github.com 整站 403 就是这么被喂出来的），所以静默一段时间。
+	warmupQuiet = 30 * time.Minute
+)
+
 // warmUpUpstreams 给热门域名做一轮 TLS 探测，把结果记进拨号评分。
 //
 // 为什么不能只靠第一次真实请求去"试错":一个黑洞地址要等 10–20 秒才报错，
 // 用户看到的就是 GitHub 打不开。提前并发探测（每个候选 3 秒）能在启动后
 // 几秒内把能用的地址顶到评分前面，代价只是启动时多几个握手。
-func warmUpUpstreams(dl *dialer.Dialer, res *resolver.Resolver, lg *log.Logger) {
+//
+// maxProbe 决定每个域名探多少个候选：启动时用 warmupFullProbe 做一次全量
+// 摸底，周期探测只用 warmupQuickProbe 确认头部几个还有效——每多探一个就是
+// 多一个打向上游的请求，常年累月的噪音会被上游当扫描器。
+// 返回本轮探到的可用地址数。
+func warmUpUpstreams(dl *dialer.Dialer, res *resolver.Resolver, lg *log.Logger, maxProbe int) int {
 	const (
 		probeTimeout = 3 * time.Second
-		// maxProbe 要能覆盖到"真正能用的地址"。种子表把 Fastly 段（140.82.x，
-		// 现在整段黑洞）排在最前，而可用的 Azure 段（20.x）排在第 11 位之后；
-		// 只探前 6 个会永远探不到好地址，探测等于白做。设成与种子规模相当，
-		// 让好地址也能被实测确认。
-		maxProbe    = 24
-		concurrency = 8
+		concurrency  = 8
+		// probeWave 是一波同时探几个。分波是为了"够用就停"：健康时段第一波
+		// 就有可用地址，不必再把剩下十几个候选挨个摸一遍。种子表把常年黑洞的
+		// Fastly 段排在最前，第一波全灭时才会继续往后探——那时才真的需要。
+		probeWave = 8
 	)
-	sem := make(chan struct{}, concurrency)
-	var (
-		wg sync.WaitGroup
-		mu sync.Mutex
-		ok int
-	)
+	total := 0
 	for _, host := range hotDomains {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		addrs, err := res.Lookup(ctx, host)
@@ -427,27 +449,50 @@ func warmUpUpstreams(dl *dialer.Dialer, res *resolver.Resolver, lg *log.Logger) 
 		if len(addrs) > maxProbe {
 			addrs = addrs[:maxProbe]
 		}
-		for _, ip := range addrs {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(host string, ip netip.Addr) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				ctx, cancel := context.WithTimeout(context.Background(), probeTimeout+time.Second)
-				defer cancel()
-				if err := dl.ProbeTLS(ctx, host, ip, probeTimeout); err != nil {
-					lg.Debug("probe %s %s: %v", host, ip, err)
-					return
-				}
-				mu.Lock()
-				ok++
-				mu.Unlock()
-				lg.Debug("probe %s %s: ok", host, ip)
-			}(host, ip)
+		for i := 0; i < len(addrs); i += probeWave {
+			end := i + probeWave
+			if end > len(addrs) {
+				end = len(addrs)
+			}
+			got := probeChunk(dl, host, addrs[i:end], probeTimeout, concurrency, lg)
+			total += len(got)
+			if len(got) > 0 {
+				break
+			}
 		}
 	}
+	lg.Info("上游候选探测完成：%d 个可用地址（%d 个热门域名，每域名最多 %d 个候选）", total, len(hotDomains), maxProbe)
+	return total
+}
+
+// probeChunk 并发探测一小批候选，返回其中可用的地址。
+func probeChunk(dl *dialer.Dialer, host string, addrs []netip.Addr, timeout time.Duration, concurrency int, lg *log.Logger) []netip.Addr {
+	sem := make(chan struct{}, concurrency)
+	var (
+		wg sync.WaitGroup
+		mu sync.Mutex
+		ok []netip.Addr
+	)
+	for _, ip := range addrs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip netip.Addr) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), timeout+time.Second)
+			defer cancel()
+			if err := dl.ProbeTLS(ctx, host, ip, timeout); err != nil {
+				lg.Debug("probe %s %s: %v", host, ip, err)
+				return
+			}
+			mu.Lock()
+			ok = append(ok, ip)
+			mu.Unlock()
+			lg.Debug("probe %s %s: ok", host, ip)
+		}(ip)
+	}
 	wg.Wait()
-	lg.Info("上游候选探测完成：%d 个可用地址（%d 个热门域名）", ok, len(hotDomains))
+	return ok
 }
 
 // probeHost 给单个域名补一轮探测（OnUpstreamError 的后台回调）。
@@ -456,6 +501,7 @@ func probeHost(dl *dialer.Dialer, res *resolver.Resolver, host string, lg *log.L
 	const (
 		probeTimeout = 3 * time.Second
 		maxProbe     = 24
+		probeWave    = 8
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	addrs, err := res.Lookup(ctx, host)
@@ -467,22 +513,21 @@ func probeHost(dl *dialer.Dialer, res *resolver.Resolver, host string, lg *log.L
 	if len(addrs) > maxProbe {
 		addrs = addrs[:maxProbe]
 	}
-	var wg sync.WaitGroup
-	for _, ip := range addrs {
-		wg.Add(1)
-		go func(ip netip.Addr) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout+time.Second)
-			defer cancel()
-			if err := dl.ProbeTLS(ctx, host, ip, probeTimeout); err != nil {
-				lg.Debug("on-demand probe %s %s: %v", host, ip, err)
-				return
+	// 按需探测同样分波：一组里探到可用地址就够了，不必把全部候选都打一遍。
+	// 每个可用地址还会顺手试同 /24 的邻居（见 probeNeighbors）。
+	for i := 0; i < len(addrs); i += probeWave {
+		end := i + probeWave
+		if end > len(addrs) {
+			end = len(addrs)
+		}
+		got := probeChunk(dl, host, addrs[i:end], probeTimeout, probeWave, lg)
+		if len(got) > 0 {
+			for _, ip := range got {
+				probeNeighbors(dl, host, ip, lg)
 			}
-			lg.Debug("on-demand probe %s %s: ok", host, ip)
-			probeNeighbors(dl, host, ip, lg)
-		}(ip)
+			break
+		}
 	}
-	wg.Wait()
 	lg.Info("按需探测完成：%s（%d 个候选）", host, len(addrs))
 }
 

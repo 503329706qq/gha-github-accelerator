@@ -191,7 +191,12 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			// 响应头到手 = 这条路是真的能干活（不只是能握手），把 IP 交给
 			// onOK 记成粘性：下一批并发请求直接走它，不再重新竞速去撞那些
 			// "TLS 通、不吐数据"的地址。
-			if t.onOK != nil {
+			//
+			// 但风控拦截页不算数：GitHub 对我们的探测/压测回过 400
+			// "Whoa there!"、403 "Access to this site has been restricted"。
+			// 这些响应只能证明"这条链路连得上"，证明不了这个地址对浏览有用，
+			// 把它立成粘性只会让后续请求继续撞同一堵墙。
+			if t.onOK != nil && !blockedStatus(resp.StatusCode) {
 				if ip, ok := rec.Get(); ok {
 					t.onOK(ip)
 				}
@@ -243,6 +248,20 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 type bodyWithCancel struct {
 	io.ReadCloser
 	cancel context.CancelFunc
+}
+
+// blockedStatus 判断状态码是不是上游的风控/限流拒绝页，而不是正常业务响应。
+//
+// 400/403/429 都可能来自 GitHub 边缘层对"这个客户端/IP 不顺眼"的拒绝：
+// 400 是 "Whoa there! You have sent an invalid request"，
+// 403 是 "Access to this site has been restricted"。它们同样有响应头，
+// 所以不能拿"收到响应头"当成"这个上游地址好用"。
+func blockedStatus(code int) bool {
+	switch code {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusTooManyRequests:
+		return true
+	}
+	return false
 }
 
 func (b *bodyWithCancel) Close() error {
