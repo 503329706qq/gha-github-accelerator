@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -205,6 +208,19 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		timer := time.AfterFunc(cap, cancel)
 		resp, err := t.base.RoundTrip(req.Clone(ctx))
 		if err == nil {
+			// 软拦截空壳不算成功。GitHub 对"看着像滥用"的客户端会回 200 +
+			// text/plain 的极短正文（2026-11-05 实测正文就是 4 字节 "OK"，
+			// 带 X-GitHub-Edge-Region）。它不是错误码，只看状态码会把它
+			// 当成"这条路能干活"，进而立成粘性——用户看到的现象是页面
+			// 一片空白、也不报错。
+			if n, soft := sniffSoftBlock(req, resp); soft {
+				timer.Stop()
+				resp.Body.Close()
+				cancel()
+				err = fmt.Errorf("上游返回软拦截空壳（%d 字节 text/plain），不算可用地址", n)
+			}
+		}
+		if err == nil {
 			// 头已到，撤销单次尝试的封顶；cancel 挂到 bodyWithCancel，
 			// 等响应体读完（或客户端断开）才触发。
 			timer.Stop()
@@ -283,6 +299,62 @@ func blockedStatus(code int) bool {
 		return true
 	}
 	return false
+}
+
+// softBlockMaxBody 是"软拦截空壳"允许的最大正文长度。真页面的正文都以
+// 十 KB 计，而 GitHub 的空壳只有几个字节，留 64 字节的余量足够。
+const softBlockMaxBody = 64
+
+// wantsHTML 判断这条请求是不是浏览器在导航（要一个页面）。
+//
+// 只对这类请求做软拦截嗅探：只有它们"拿到 200 却几乎没有正文"才是异常。
+// fetch/XHR 的 Accept 是 */*，raw 上的小 .txt 也可能是 text/plain 的短正文，
+// 那些不该被误判。
+func wantsHTML(req *http.Request) bool {
+	return strings.Contains(strings.ToLower(req.Header.Get("Accept")), "text/html")
+}
+
+// sniffSoftBlock 判断响应是不是 GitHub 的软拦截空壳：200 + text/plain +
+// 正文短到不可能是页面（实测 4 字节 "OK"）。
+//
+// 返回正文长度与判定结果；如果不是空壳，会把已经读出来的字节接回 resp.Body，
+// 调用方拿到的响应内容与未嗅探时完全一致。
+func sniffSoftBlock(req *http.Request, resp *http.Response) (int, bool) {
+	if resp.StatusCode != http.StatusOK || !wantsHTML(req) {
+		return 0, false
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.HasPrefix(ct, "text/plain") {
+		return 0, false
+	}
+	buf := make([]byte, softBlockMaxBody+1)
+	n, err := io.ReadFull(resp.Body, buf)
+	if n <= softBlockMaxBody {
+		if err == nil {
+			// 理论上不会发生（读满 len(buf) 才算 nil），保守起见按"不是空壳"处理。
+			resp.Body = io.NopCloser(bytes.NewReader(buf[:n]))
+			return n, false
+		}
+		body := strings.TrimSpace(strings.ToLower(string(buf[:n])))
+		// 只认 GitHub 实际用的两种空壳形态：空正文，或字面的 "ok"。
+		if body == "" || body == "ok" {
+			return n, true
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(buf[:n]))
+		return n, false
+	}
+	// 正文比阈值长，说明不是空壳：把读到的字节接回去。
+	resp.Body = &restoredBody{
+		Reader: io.MultiReader(bytes.NewReader(buf[:n]), resp.Body),
+		Closer: resp.Body,
+	}
+	return n, false
+}
+
+// restoredBody 把嗅探时读出来的前导字节接回原始 body，Close 仍然关底层连接。
+type restoredBody struct {
+	io.Reader
+	io.Closer
 }
 
 func (b *bodyWithCancel) Close() error {
