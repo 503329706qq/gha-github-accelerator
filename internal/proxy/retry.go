@@ -48,21 +48,29 @@ type retryTransport struct {
 // 健康时段单个坏 IP 由重试内部消化（第 2 次就换到好地址并成功，noteOK 会
 // 把累计清零），只有整段一起哑时才会在短时间内连续攒够失败尝试。一旦降级：
 // 每条新请求只赌一次（2.5s 封顶），已经在飞的请求也不再跑完剩余重试，
-// 502 快速返回让浏览器自己重试——比整屏请求挂满 12s 强得多。第一条成功的
-// 请求立刻解除降级。
+// 502 快速返回让浏览器自己重试——比整屏请求挂满 12s 强得多。
+// 解除要等"连续 3 次拿到响应头"，不能一次成功就解除。
 const (
 	attemptFailThreshold = 6 // 约等于 1.5 条请求的全部尝试，兼顾并发首波
 	attemptFailWindow    = 10 * time.Second
 	degradedWindow       = 20 * time.Second
 	degradedAttempts     = 1
 	degradedCap          = 2500 * time.Millisecond
+	// degradedRecoveryStreak 是解除降级需要的连续成功次数。
+	//
+	// 原先"一次成功就解除"会造成抖动：2026-11-05 08:44–08:47 的故障波形里，
+	// 降级窗口被 sporadic 的成功反复关掉又打开，11 个请求又跑满 4 次尝试、
+	// 重新变成 12000ms 的 502。故障期间"偶尔漏过一个请求"是常态，得连续
+	// 成功几次才说明链路真的回来了。
+	degradedRecoveryStreak = 3
 )
 
 // hostHealth 记录一个上游 host 当前的失败累计与降级窗口。
 type hostHealth struct {
-	fails int       // 本次统计窗口内累计的尝试失败次数
-	first time.Time // 本统计窗口的起点
-	until time.Time // 降级窗口截止（零值表示未降级）
+	fails  int       // 本次统计窗口内累计的尝试失败次数
+	first  time.Time // 本统计窗口的起点
+	until  time.Time // 降级窗口截止（零值表示未降级）
+	streak int       // 降级后连续成功的次数，攒够 degradedRecoveryStreak 才解除
 }
 
 // degraded 判断该 host 当前是否处于快速失败窗口。
@@ -94,6 +102,8 @@ func (t *retryTransport) noteAttemptFailure(host string) bool {
 		h = &hostHealth{first: now}
 		t.health[host] = h
 	}
+	// 失败打断"连续成功"的计数。
+	h.streak = 0
 	if now.Before(h.until) {
 		// 已经在降级窗口内：续期即可，不重复计数、不重复打日志。
 		h.until = now.Add(degradedWindow)
@@ -113,11 +123,22 @@ func (t *retryTransport) noteAttemptFailure(host string) bool {
 	return true
 }
 
-// noteOK 一条请求真的拿到了响应头：说明链路恢复，清掉该 host 的失败累计与降级。
+// noteOK 一条请求真的拿到了响应头。连续够 degradedRecoveryStreak 次才算链路
+// 真的恢复，清掉该 host 的失败累计与降级；零星成功不清，避免降级窗口抖动。
 func (t *retryTransport) noteOK(host string) {
+	if host == "" {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.health, host)
+	h := t.health[host]
+	if h == nil {
+		return
+	}
+	h.streak++
+	if h.streak >= degradedRecoveryStreak {
+		delete(t.health, host)
+	}
 }
 
 // maxBudget 是所有尝试共享的总预算。到了就不再发起新尝试——

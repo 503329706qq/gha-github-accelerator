@@ -181,7 +181,10 @@ func TestNoDegradedWhenRetrySucceeds(t *testing.T) {
 	}
 }
 
-// 一条成功就立刻解除降级，且失败累计从零开始重新算。
+// 解除降级要连续成功 degradedRecoveryStreak 次，且失败累计从零开始重新算。
+//
+// 2026-11-05 08:44–08:47 的实测：故障期间零星漏过一个成功请求，旧逻辑
+// "一次成功就解除"让降级窗口反复开关，11 个请求又跑满 4 次尝试回到 12000ms。
 func TestSuccessClearsDegraded(t *testing.T) {
 	base := &silentTransport{ips: []string{"192.0.2.1"}}
 	rt, _ := newDegradedTestTransport(base, attemptFailThreshold)
@@ -200,8 +203,24 @@ func TestSuccessClearsDegraded(t *testing.T) {
 		t.Fatalf("链路恢复后应当成功: %v", err)
 	}
 	resp.Body.Close()
+	if !rt.degraded("github.com") {
+		t.Fatal("只成功 1 次不该解除降级（会抖动）")
+	}
+
+	// 中间夹一次失败，把"连续成功"打断。
+	if _, err := doGet(t, rt); err == nil {
+		t.Fatal("这一轮应当失败")
+	}
+	for i := 0; i < degradedRecoveryStreak; i++ {
+		base.succeed.Store(true)
+		r, err := doGet(t, rt)
+		if err != nil {
+			t.Fatalf("第 %d 次连续成功失败: %v", i+1, err)
+		}
+		r.Body.Close()
+	}
 	if rt.degraded("github.com") {
-		t.Fatal("成功的请求必须解除降级")
+		t.Fatalf("连续 %d 次成功之后应当解除降级", degradedRecoveryStreak)
 	}
 
 	base.calls.Store(0)
